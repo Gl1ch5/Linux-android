@@ -1,0 +1,60 @@
+name: build-images
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'scripts/build-rootfs-*.sh'
+      - '.github/workflows/build-images.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  xfce-light:
+    # Native arm64 runner: no QEMU, so debootstrap runs at full speed.
+    # Note: arm64 hosted runners may be unavailable for some repositories; then switch to QEMU.
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Инструменты
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends debootstrap zstd
+
+      - name: Сборка rootfs
+        run: sudo bash scripts/build-rootfs-xfce.sh out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: image-xfce-light
+          path: out/*
+          retention-days: 7
+
+  publish:
+    needs: [xfce-light]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Публикация images.json и архивов
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # images.json = сумма всех фрагментов image-*.json из этого запуска.
+          python3 - <<'PY'
+          import glob, json
+          items = [json.load(open(p, encoding="utf-8")) for p in sorted(glob.glob("dist/image-*.json"))]
+          json.dump({"schema": 1, "images": items}, open("dist/images.json", "w", encoding="utf-8"),
+                    ensure_ascii=False, indent=2)
+          PY
+          TAG="images-$(date -u +%Y%m%d)"
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" --title "Образы $(date -u +%Y-%m-%d)" \
+              --notes "Автосборка rootfs (aarch64). images.json описывает все образы."
+          gh release upload "$TAG" dist/*.rootfs.tar.zst dist/*.sha256 dist/images.json --clobber

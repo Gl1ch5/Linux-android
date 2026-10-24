@@ -1,0 +1,105 @@
+name: build-turnip
+
+on:
+  schedule:
+    # Daily; minute 17 avoids the top-of-hour rush.
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: 'Какой канал собирать'
+        type: choice
+        options: [both, stable, nightly]
+        default: both
+
+permissions:
+  contents: write
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    outputs:
+      channels: ${{ steps.p.outputs.channels }}
+    steps:
+      - id: p
+        run: |
+          CH="${{ github.event.inputs.channel || 'both' }}"
+          if [[ "$CH" == "both" ]]; then echo 'channels=["stable","nightly"]' >> "$GITHUB_OUTPUT"
+          else echo "channels=[\"$CH\"]" >> "$GITHUB_OUTPUT"; fi
+
+  build-glibc:
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        channel: ${{ fromJSON(needs.plan.outputs.channels) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Зависимости
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            meson ninja-build pkg-config python3-mako python3-yaml python3-ply \
+            bison flex glslang-tools glslang-dev \
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            zstd curl git
+      - name: Сборка
+        run: bash scripts/build-turnip.sh "${{ matrix.channel }}" glibc out
+      - uses: actions/upload-artifact@v4
+        with:
+          name: turnip-${{ matrix.channel }}-glibc
+          path: out/*
+          retention-days: 7
+
+  build-musl:
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        channel: ${{ fromJSON(needs.plan.outputs.channels) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+      - name: Сборка в aarch64 Alpine (musl)
+        run: |
+          docker run --rm --platform linux/arm64 \
+            -v "$PWD":/src -w /src \
+            -e WORK=/src/work \
+            alpine:3.20 sh -c '
+              apk add --no-cache bash curl git python3 py3-mako py3-yaml py3-ply \
+                meson ninja pkgconf bison flex glslang-dev zstd build-base coreutils
+              bash scripts/build-turnip.sh "${{ matrix.channel }}" musl out'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: turnip-${{ matrix.channel }}-musl
+          path: out/*
+          retention-days: 7
+
+  publish:
+    needs: [build-glibc, build-musl]
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Публикация в Releases
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          for CH in stable nightly; do
+            TAG="turnip-$CH"
+            FILES=$(ls dist/turnip-$CH-* dist/manifest-$CH-*.json 2>/dev/null || true)
+            [[ -z "$FILES" ]] && continue
+            gh release view "$TAG" >/dev/null 2>&1 || \
+              gh release create "$TAG" --prerelease --title "Turnip $CH" \
+                --notes "Автосборка Mesa (канал $CH), KGSL, aarch64. Манифест и sha256 рядом с архивом."
+            gh release upload "$TAG" $FILES --clobber
+          done
