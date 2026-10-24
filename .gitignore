@@ -1,0 +1,18 @@
+*.iml
+.gradle/
+build/
+local.properties
+.idea/
+.kotlin/
+captures/
+.externalNativeBuild/
+.cxx/
+
+# Signing material must never be committed
+*.jks
+*.keystore
+keystore.properties
+
+# Binaries produced by CI (proot, loader, Mesa/Turnip, rootfs) are downloaded, not committed
+app/src/main/jniLibs/**/*.so
+*.rootfs.tar.zst
